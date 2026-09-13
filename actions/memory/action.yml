@@ -1,0 +1,79 @@
+name: Task Memory
+description: >
+  Saves or restores agent task memory from Actions Cache.
+  Format: sigil-based compact text (%hall-task v1 header, !field lines).
+  Cache key: hall-task-{repo}-{pr_number} when a PR exists,
+  hall-task-{repo}-issue-{issue_number} when not.
+  Expires after 7 days of inactivity. On restore cache-miss, the caller should
+  pass the thread URL to the agent as fallback context so it can reconstruct
+  state from the issue/PR history.
+
+inputs:
+  mode:
+    description: "save | restore"
+    required: true
+  repo:
+    description: "Repository in {owner}/{name} format"
+    required: true
+  pr-number:
+    description: PR number this task is associated with (takes priority over issue-number)
+    required: false
+    default: ""
+  issue-number:
+    description: Issue number used as fallback cache key when no PR exists yet
+    required: false
+    default: ""
+  memory-json:
+    description: JSON string to save (required when mode=save)
+    required: false
+    default: ""
+  scripts-dir:
+    description: Path to the scripts/ directory (default assumes Hall repo checked out at .hall/)
+    required: false
+    default: ".hall/scripts"
+
+outputs:
+  memory-json:
+    description: Restored memory JSON string (empty string on cache miss)
+    value: ${{ steps.run.outputs.memory-json }}
+  cache-hit:
+    description: "true if the cache was restored successfully, false on miss"
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute cache key
+      id: key
+      shell: bash
+      run: |
+        REPO="${{ inputs.repo }}"
+        SAFE_REPO=$(echo "$REPO" | tr '/' '-')
+        if [ -n "${{ inputs.pr-number }}" ]; then
+          echo "cache-key=hall-task-${SAFE_REPO}-${{ inputs.pr-number }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "cache-key=hall-task-${SAFE_REPO}-issue-${{ inputs.issue-number }}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Restore memory cache
+      id: restore
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@v4
+      with:
+        path: .hall-memory.json
+        key: ${{ steps.key.outputs.cache-key }}
+
+    - name: Read or write memory
+      id: run
+      shell: bash
+      env:
+        MODE:        ${{ inputs.mode }}
+        MEMORY_JSON: ${{ inputs.memory-json }}
+      run: bash "${{ inputs.scripts-dir }}/save-restore-memory.sh"
+
+    - name: Save memory cache
+      if: inputs.mode == 'save'
+      uses: actions/cache/save@v4
+      with:
+        path: .hall-memory.json
+        key: ${{ steps.key.outputs.cache-key }}

@@ -1,0 +1,52 @@
+name: Invocation Counter
+description: >
+  Increments HALL_USAGE_COUNT in the invoker's GitHub Environment via the REST API.
+  The current count is read from vars.HALL_USAGE_COUNT in the calling job (injected
+  automatically because the job runs in environment: invoker/<handle>) and passed as an
+  input. No cache, no JSON blobs — one PATCH call on increment.
+
+inputs:
+  current-count:
+    description: Current value read from vars.HALL_USAGE_COUNT in the calling job
+    required: true
+  environment-name:
+    description: Full GitHub Environment name (e.g. invoker/<githandle>)
+    required: true
+  repo-owner:
+    description: Repository owner
+    required: true
+  repo-name:
+    description: Repository name
+    required: true
+  app-token:
+    description: GitHub App installation token (environments:write required)
+    required: true
+  increment:
+    description: Amount to add to the counter per dispatch (default 3 = 1 dispatch-hour)
+    required: false
+    default: "3"
+  scripts-dir:
+    description: Path to the scripts/ directory (default assumes Hall repo checked out at .hall/)
+    required: false
+    default: ".hall/scripts"
+
+outputs:
+  count:
+    description: New invocation count after increment
+    value: ${{ steps.increment.outputs.count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Increment and persist
+      id: increment
+      shell: bash
+      env:
+        MODE:          increment
+        GH_TOKEN:      ${{ inputs.app-token }}
+        CURRENT_COUNT: ${{ inputs.current-count }}
+        INCREMENT:     ${{ inputs.increment }}
+        ENV_NAME:      ${{ inputs.environment-name }}
+        REPO_OWNER:    ${{ inputs.repo-owner }}
+        REPO_NAME:     ${{ inputs.repo-name }}
+      run: bash "${{ inputs.scripts-dir }}/quota-counter.sh"

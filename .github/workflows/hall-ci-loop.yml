@@ -1,0 +1,264 @@
+name: "[Hall] CI Re-dispatch Loop"
+
+on:
+  check_suite:
+    types: [completed]
+
+jobs:
+  # ── Job 1: identify agent from the failing PR ────────────────────────────
+  detect:
+    name: Detect agent from failing check suite
+    runs-on: ubuntu-latest
+    outputs:
+      agent:        ${{ steps.ctx.outputs.agent }}
+      pr-number:    ${{ steps.ctx.outputs.pr-number }}
+      issue-number: ${{ steps.ctx.outputs.issue-number }}
+      repo-owner:   ${{ steps.ctx.outputs.repo-owner }}
+      repo-name:    ${{ steps.ctx.outputs.repo-name }}
+      ci-failures:  ${{ steps.ctx.outputs.ci-failures }}
+    steps:
+      - name: Checkout Hall repo (scripts only)
+        uses: actions/checkout@v4
+        with:
+          path: .hall
+          sparse-checkout: scripts/
+          sparse-checkout-cone-mode: true
+
+      - name: Resolve context from check_suite event
+        id: ctx
+        uses: actions/github-script@v7
+        env:
+          ACTION: ci
+        with:
+          script: |
+            const fn = require('./.hall/scripts/detect-context.js')
+            await fn({ github, context, core })
+
+  # ── Job 2: pool-select invoker ────────────────────────────────────────────
+  select-invoker:
+    name: Select invoker from pool
+    needs: [detect]
+    if: needs.detect.outputs.agent != ''
+    runs-on: ubuntu-latest
+    outputs:
+      invoker:       ${{ steps.pool.outputs.invoker }}
+      invoker-count: ${{ steps.pool.outputs.invoker-count }}
+    steps:
+      - name: Checkout Hall repo (scripts only)
+        uses: actions/checkout@v4
+        with:
+          path: .hall
+          sparse-checkout: scripts/
+          sparse-checkout-cone-mode: true
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id:      ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Select least-used invoker
+        id: pool
+        uses: actions/github-script@v7
+        env:
+          FAIL_FAST:    'true'
+          FAIL_MESSAGE: 'No invoker available — all at cap.'
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fn = require('./.hall/scripts/select-invoker.js')
+            await fn({ github, context, core })
+
+  # ── Job 3: retry or escalate ─────────────────────────────────────────────
+  redispatch:
+    name: Re-dispatch ${{ needs.detect.outputs.agent }}
+    needs: [detect, select-invoker]
+    if: needs.detect.outputs.agent != '' && needs.select-invoker.outputs.invoker != ''
+    runs-on: ubuntu-latest
+    environment: invoker/${{ needs.select-invoker.outputs.invoker }}
+    concurrency:
+      group: hall-${{ needs.detect.outputs.agent }}-${{ needs.detect.outputs.issue-number || github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id:      ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner:       ${{ needs.detect.outputs.repo-owner }}
+
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.detect.outputs.repo-owner }}/${{ needs.detect.outputs.repo-name }}
+          token:      ${{ steps.app-token.outputs.token }}
+
+      - name: Checkout Hall repo
+        uses: actions/checkout@v4
+        with:
+          path: .hall
+
+      - name: Increment invoker weekly counter
+        id: increment
+        uses: ./.hall/actions/counter
+        with:
+          current-count:    ${{ needs.select-invoker.outputs.invoker-count }}
+          environment-name: invoker/${{ needs.select-invoker.outputs.invoker }}
+          repo-owner:       ${{ needs.detect.outputs.repo-owner }}
+          repo-name:        ${{ needs.detect.outputs.repo-name }}
+          app-token:        ${{ steps.app-token.outputs.token }}
+
+      - name: Read agent config
+        id: agent-cfg
+        env:
+          AGENT: ${{ needs.detect.outputs.agent }}
+        shell: bash
+        run: bash .hall/scripts/read-agent-config.sh
+
+      - name: Restore task memory
+        id: memory
+        uses: ./.hall/actions/memory
+        with:
+          mode:      restore
+          repo:      ${{ needs.detect.outputs.repo-owner }}/${{ needs.detect.outputs.repo-name }}
+          pr-number: ${{ needs.detect.outputs.pr-number }}
+
+      - name: Resolve retry count
+        id: retry
+        env:
+          MEMORY:      ${{ steps.memory.outputs.memory-json }}
+          MAX_RETRIES: ${{ steps.agent-cfg.outputs.max-retries }}
+        shell: bash
+        run: bash .hall/scripts/resolve-retry.sh
+
+      # ── Escalation path ───────────────────────────────────────────────────
+
+      - name: Escalate — notify keeper on PR
+        if: steps.retry.outputs.escalate == 'true'
+        env:
+          ACTION:       escalate
+          REPO_OWNER:   ${{ needs.detect.outputs.repo-owner }}
+          REPO_NAME:    ${{ needs.detect.outputs.repo-name }}
+          PR_NUMBER:    ${{ needs.detect.outputs.pr-number }}
+          invoker:      ${{ needs.select-invoker.outputs.invoker }}
+          RETRY_COUNT:  ${{ steps.retry.outputs.count }}
+          CI_FAILURES:  ${{ needs.detect.outputs.ci-failures }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const fn = require('./.hall/scripts/notification.js')
+            await fn({ github, core })
+
+      - name: Update status card — escalated
+        if: steps.retry.outputs.escalate == 'true' && needs.detect.outputs.issue-number != ''
+        uses: ./.hall/actions/status-card
+        with:
+          app-token:    ${{ steps.app-token.outputs.token }}
+          repo-owner:   ${{ needs.detect.outputs.repo-owner }}
+          repo-name:    ${{ needs.detect.outputs.repo-name }}
+          issue-number: ${{ needs.detect.outputs.issue-number }}
+          agent:        ${{ needs.detect.outputs.agent }}
+          stage:        escalated
+
+      # ── Re-dispatch path ──────────────────────────────────────────────────
+
+      - name: Update status card — ci-fix
+        if: steps.retry.outputs.escalate != 'true' && needs.detect.outputs.issue-number != ''
+        uses: ./.hall/actions/status-card
+        with:
+          app-token:    ${{ steps.app-token.outputs.token }}
+          repo-owner:   ${{ needs.detect.outputs.repo-owner }}
+          repo-name:    ${{ needs.detect.outputs.repo-name }}
+          issue-number: ${{ needs.detect.outputs.issue-number }}
+          agent:        ${{ needs.detect.outputs.agent }}
+          stage:        ci-fix
+          extra:        attempt ${{ steps.retry.outputs.new-count }} of ${{ steps.agent-cfg.outputs.max-retries }}
+          pr-number:    ${{ needs.detect.outputs.pr-number }}
+
+      - name: Inject persona and CI context
+        if: steps.retry.outputs.escalate != 'true'
+        env:
+          MODE:        ci
+          AGENT:       ${{ needs.detect.outputs.agent }}
+          ATTEMPT:     ${{ steps.retry.outputs.new-count }}
+          MAX_RETRIES: ${{ steps.agent-cfg.outputs.max-retries }}
+          PR_NUMBER:   ${{ needs.detect.outputs.pr-number }}
+          CI_FAILURES: ${{ needs.detect.outputs.ci-failures }}
+        shell: bash
+        run: bash .hall/scripts/context-injection.sh
+      #[lore-keeper]: inject temp claude.md of invoke.yml;
+      - name: Run agent
+        id: agent
+        if: steps.retry.outputs.escalate != 'true'
+        uses: ./.hall/actions/dispatch
+        with:
+          oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          app-token:   ${{ steps.app-token.outputs.token }}
+          prompt: >-
+            CI checks have failed on PR #${{ needs.detect.outputs.pr-number }}
+            in ${{ needs.detect.outputs.repo-owner }}/${{ needs.detect.outputs.repo-name }}.
+            The failing checks and attempt count are appended to CLAUDE.md (the workflow
+            reads task memory from cache and injects it there before invoking you).
+            Fix the failures and push to the existing branch — do not open a new PR.
+
+      - name: Save updated task memory
+        if: always() && steps.retry.outputs.escalate != 'true'
+        uses: ./.hall/actions/memory
+        with:
+          mode:        save
+          repo:        ${{ needs.detect.outputs.repo-owner }}/${{ needs.detect.outputs.repo-name }}
+          pr-number:   ${{ needs.detect.outputs.pr-number }}
+          memory-json: |-
+            %hall-task v1 | ${{ needs.detect.outputs.repo-owner }}/${{ needs.detect.outputs.repo-name }}
+            !agent ${{ needs.detect.outputs.agent }}
+            !issue ${{ needs.detect.outputs.issue-number || '-' }}
+            !pr ${{ needs.detect.outputs.pr-number || '-' }}
+            !branch -
+            !retry ${{ steps.retry.outputs.new-count }}
+            !ci ${{ needs.detect.outputs.ci-failures || '-' }}
+            !review -
+
+      - name: Read dispatch outcome
+        id: ci-outcome
+        if: always() && steps.retry.outputs.escalate != 'true'
+        shell: bash
+        run: |
+          OUTCOME=$(jq -r '.outcome // "comment_posted"' .hall/dispatch-result.json 2>/dev/null || echo "comment_posted")
+          echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+
+      - name: Post-dispatch audit
+        if: always() && steps.retry.outputs.escalate != 'true'
+        uses: ./.hall/actions/post-dispatch
+        with:
+          app-token:          ${{ steps.app-token.outputs.token }}
+          agent:              ${{ needs.detect.outputs.agent }}
+          agent-dispatched:   ${{ needs.detect.outputs.agent }}
+          repo-owner:         ${{ needs.detect.outputs.repo-owner }}
+          repo-name:          ${{ needs.detect.outputs.repo-name }}
+          issue-number:       ${{ needs.detect.outputs.issue-number }}
+          pr-number:          ${{ needs.detect.outputs.pr-number }}
+          invoker:            ${{ needs.select-invoker.outputs.invoker }}
+          team-validated:     ${{ steps.agent-cfg.outputs.team-slug }}
+          token-input:        ${{ steps.agent.outputs.token-input }}
+          token-output:       ${{ steps.agent.outputs.token-output }}
+          retry-count:        ${{ steps.retry.outputs.new-count }}
+          outcome:            ${{ steps.ci-outcome.outputs.outcome }}
+          weekly-count-after: ${{ steps.increment.outputs.count }}
+
+      - name: Update status card — pr-opened
+        if: always() && steps.retry.outputs.escalate != 'true' && needs.detect.outputs.issue-number != ''
+        uses: ./.hall/actions/status-card
+        with:
+          app-token:    ${{ steps.app-token.outputs.token }}
+          repo-owner:   ${{ needs.detect.outputs.repo-owner }}
+          repo-name:    ${{ needs.detect.outputs.repo-name }}
+          issue-number: ${{ needs.detect.outputs.issue-number }}
+          agent:        ${{ needs.detect.outputs.agent }}
+          stage:        pr-opened
+          pr-number:    ${{ needs.detect.outputs.pr-number }}
+
+
+#[lore-keeper]: reading the file is overwhealming, each job should be defined in its own action file

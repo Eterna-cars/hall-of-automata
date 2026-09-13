@@ -1,0 +1,179 @@
+# have you ever danced with the devil in the pale moonlight?
+name: Dispatch Agent
+description: >
+  Runs the Claude Code Action with the agent's OAuth token.
+  Callers write the agent persona to CLAUDE.md before calling this action;
+  Claude Code picks it up automatically as project-level instructions.
+
+inputs:
+  oauth-token:
+    description: Claude OAuth token from the agent's GitHub Environment
+    required: true
+  app-token:
+    description: GitHub App installation token (used by the action for GitHub API calls)
+    required: true
+  max-turns:
+    description: Maximum number of agentic turns. Empty = no ceiling (run to natural completion).
+    required: false
+    default: ""
+  model:
+    description: Claude model ID (e.g. claude-sonnet-4-6). Empty = action default.
+    required: false
+    default: ""
+  mcp-config:
+    description: Path to mcp.json config file. Empty = no MCP servers.
+    required: false
+    default: ""
+  allowed-tools:
+    description: Comma-separated list of allowed MCP tool names. Empty = no restriction.
+    required: false
+    default: ""
+  prompt:
+    description: Direct prompt passed to Claude (bypasses trigger-phrase/label checks)
+    required: false
+    default: ""
+
+outputs:
+  token-status:
+    description: Categorized API result — ok | unauthorized | rate_limited | error
+    value: ${{ steps.categorize.outputs.token-status }}
+  token-input:
+    description: Total input tokens consumed by this dispatch
+    value: ${{ steps.tokens.outputs.token-input }}
+  token-output:
+    description: Total output tokens consumed by this dispatch
+    value: ${{ steps.tokens.outputs.token-output }}
+
+runs:
+  using: composite
+  steps:
+    - name: Mask OAuth token
+      shell: bash
+      run: echo "::add-mask::${{ inputs.oauth-token }}"
+
+    - name: Build claude args
+      id: build-args
+      shell: bash
+      run: |
+        ARGS="--dangerously-skip-permissions"
+        if [ -n "${{ inputs.max-turns }}" ]; then
+          ARGS="--max-turns ${{ inputs.max-turns }} $ARGS"
+        fi
+        if [ -n "${{ inputs.model }}" ]; then
+          ARGS="$ARGS --model ${{ inputs.model }}"
+        fi
+        if [ -n "${{ inputs.mcp-config }}" ] && [ -f "${{ inputs.mcp-config }}" ]; then
+          ARGS="$ARGS --mcp-config ${{ inputs.mcp-config }}"
+        fi
+        if [ -n "${{ inputs.allowed-tools }}" ]; then
+          ARGS="$ARGS --allowedTools '${{ inputs.allowed-tools }}'"
+        fi
+        echo "value=$ARGS" >> "$GITHUB_OUTPUT"
+
+    - name: Run Claude Code Action
+      id: run-claude
+      continue-on-error: true
+      uses: anthropics/claude-code-action@v1
+      with:
+        claude_code_oauth_token: ${{ inputs.oauth-token }}
+        github_token: ${{ inputs.app-token }}
+        # Allow the Hall App bot to trigger dispatches (relay-initiated workflow_dispatch)
+        allowed_bots: "hall-of-automata[bot]"
+        # --dangerously-skip-permissions: required in non-interactive CI runners — no human to
+        # approve tool-use prompts. The actual security boundary is the GitHub App token scope,
+        # not Claude Code's permission prompts.
+        claude_args: ${{ steps.build-args.outputs.value }}
+        prompt: ${{ inputs.prompt }}
+        show_full_output: "true"
+
+    - name: Categorize API result
+      id: categorize
+      if: always()
+      shell: bash
+      env:
+        DISPATCH_OUTCOME: ${{ steps.run-claude.outcome }}
+        OAUTH_TOKEN: ${{ inputs.oauth-token }}
+      run: |
+        if [[ "${DISPATCH_OUTCOME}" == "success" ]]; then
+          echo "token-status=ok" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+        HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+          --max-time 15 \
+          -X POST "https://api.anthropic.com/v1/messages" \
+          -H "Authorization: Bearer ${OAUTH_TOKEN}" \
+          -H "anthropic-version: 2023-06-01" \
+          -H "Content-Type: application/json" \
+          -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}') \
+          || HTTP=000
+        echo "probe HTTP: ${HTTP}"
+        if [[ "${HTTP}" == "429" ]]; then
+          echo "token-status=rate_limited" >> "${GITHUB_OUTPUT}"
+        elif [[ "${HTTP}" == "401" || "${HTTP}" == "403" ]]; then
+          echo "token-status=unauthorized" >> "${GITHUB_OUTPUT}"
+        elif [[ "${HTTP}" == "200" ]]; then
+          # Token is valid — SDK exited due to max_turns or a soft SDK error, not an auth issue
+          echo "token-status=max_turns" >> "${GITHUB_OUTPUT}"
+        else
+          echo "token-status=error" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Extract token usage
+      id: tokens
+      if: always()
+      shell: bash
+      run: |
+        EXEC_FILE="${{ steps.run-claude.outputs.execution_file }}"
+        if [ -z "$EXEC_FILE" ] || [ ! -f "$EXEC_FILE" ]; then
+          echo "token-input=0" >> "$GITHUB_OUTPUT"
+          echo "token-output=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # Sum tokens across all API response entries.
+        # Tries .message.usage path (SDK AssistantMessage) then flat .usage path.
+        TOKEN_INPUT=$(jq -r '[.[] | ((.message.usage.input_tokens // .usage.input_tokens // 0) + (.message.usage.cache_creation_input_tokens // .usage.cache_creation_input_tokens // 0)) | numbers] | add // 0' "$EXEC_FILE" 2>/dev/null || echo "0")
+        TOKEN_OUTPUT=$(jq -r '[.[] | (.message.usage.output_tokens // .usage.output_tokens // 0) | numbers] | add // 0' "$EXEC_FILE" 2>/dev/null || echo "0")
+        [ -z "$TOKEN_INPUT" ] || [ "$TOKEN_INPUT" = "null" ] && TOKEN_INPUT=0
+        [ -z "$TOKEN_OUTPUT" ] || [ "$TOKEN_OUTPUT" = "null" ] && TOKEN_OUTPUT=0
+        echo "token-input=$TOKEN_INPUT" >> "$GITHUB_OUTPUT"
+        echo "token-output=$TOKEN_OUTPUT" >> "$GITHUB_OUTPUT"
+
+    # When the SDK exits before the agent writes dispatch-result.json, write it here so
+    # post-dispatch steps can route correctly. Three distinct failure modes:
+    #   rate_limited (HTTP 429) — quota hit; outcome=quota_exceeded → nightly retry
+    #   max_turns    (HTTP 200) — token fine, SDK hit turn limit; outcome=max_turns_exceeded → escalated
+    #   error/unauthorized     — bad token or unrecoverable SDK error; outcome=failed → no retry
+    - name: Write dispatch-result on SDK failure
+      if: steps.run-claude.outcome == 'failure'
+      shell: bash
+      run: |
+        if [ -f ".hall/dispatch-result.json" ]; then
+          echo "dispatch-result.json already written by agent; skipping"
+          exit 0
+        fi
+        mkdir -p .hall
+        TOKEN_STATUS="${{ steps.categorize.outputs.token-status }}"
+        if [[ "$TOKEN_STATUS" == "rate_limited" ]]; then
+          printf '{"outcome":"quota_exceeded","pr_number":"","branch":""}\n' > .hall/dispatch-result.json
+          echo "Wrote dispatch-result.json with outcome: quota_exceeded"
+        elif [[ "$TOKEN_STATUS" == "max_turns" ]]; then
+          printf '{"outcome":"max_turns_exceeded","pr_number":"","branch":""}\n' > .hall/dispatch-result.json
+          echo "Wrote dispatch-result.json with outcome: max_turns_exceeded"
+        else
+          printf '{"outcome":"failed","pr_number":"","branch":""}\n' > .hall/dispatch-result.json
+          echo "Wrote dispatch-result.json with outcome: failed (token-status=$TOKEN_STATUS)"
+        fi
+
+    # Propagate SDK failure only when the agent did NOT complete successfully.
+    # The SDK wrapper sometimes exits 1 post-completion (cleanup errors); if the
+    # agent already wrote a success outcome in dispatch-result.json, suppress it.
+    - name: Propagate agent failure
+      if: steps.run-claude.outcome == 'failure'
+      shell: bash
+      run: |
+        OUTCOME=$(jq -r '.outcome // ""' .hall/dispatch-result.json 2>/dev/null || echo "")
+        if [[ "$OUTCOME" == "comment_posted" || "$OUTCOME" == "pr_created" || "$OUTCOME" == "awaiting_input" || "$OUTCOME" == "rerouted" ]]; then
+          echo "Agent completed successfully (outcome=$OUTCOME); suppressing SDK wrapper exit 1"
+          exit 0
+        fi
+        exit 1

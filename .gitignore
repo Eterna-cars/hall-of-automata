@@ -1,0 +1,19 @@
+# MkDocs build output
+site/
+
+# Local plans and notes
+*_PLAN.md
+
+# Python / uv
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+uv.lock
+.python-version
+
+# Editor / tooling
+.claude/
+
+# Deploy scripts (moved to hall-relay)
+deploy/

@@ -1,0 +1,93 @@
+name: Authorize Invoker
+description: >
+  Validates that the invoker is a member of the agent's authorized GitHub team.
+  On failure: removes the trigger label (if label-triggered), posts a rejection
+  comment tagging @<org>/automata-invokers, and calls core.setFailed() — which
+  hard-stops the calling job. No output is set; callers do not need to gate on
+  an authorized flag.
+
+inputs:
+  org-read-token:
+    description: PAT with read:org scope for team membership checks
+    required: true
+  org:
+    description: GitHub organization name
+    required: true
+  team-slug:
+    description: GitHub team slug to check membership against
+    required: true
+  username:
+    description: GitHub login of the invoker (github.event.sender.login)
+    required: true
+  app-token:
+    description: GitHub App installation token for posting comments and removing labels
+    required: true
+  repo-owner:
+    description: Owner of the target repository
+    required: true
+  repo-name:
+    description: Name of the target repository
+    required: true
+  issue-number:
+    description: Issue or PR number where the invocation occurred
+    required: true
+  trigger-event:
+    description: "issue_labeled | issue_comment | pr_review — used to decide whether to remove a label"
+    required: true
+  label-name:
+    description: Label to remove if the invoker is unauthorized and trigger was issue_labeled
+    required: false
+    default: ""
+  agent-name:
+    description: Display name of the agent, used in the rejection comment
+    required: true
+  bot-login:
+    description: >
+      Login of the Hall GitHub App bot (e.g. hall-of-automata[bot]).
+      When the actor matches this login the team-membership check is bypassed —
+      the Hall bot is always authorized for its own orchestration actions.
+      Derived from the app-slug output of create-github-app-token.
+    required: false
+    default: "hall-of-automata[bot]"
+  scripts-dir:
+    description: Path to the scripts/ directory (default assumes Hall repo checked out at .hall/)
+    required: false
+    default: ".hall/scripts"
+
+runs:
+  using: composite
+  steps:
+    - name: Check team membership
+      id: check
+      uses: actions/github-script@v7
+      env:
+        ACTION:         check-membership
+        ORG:            ${{ inputs.org }}
+        TEAM_SLUG:      ${{ inputs.team-slug }}
+        USERNAME:       ${{ inputs.username }}
+        HALL_BOT_LOGIN: ${{ inputs.bot-login }}
+      with:
+        github-token: ${{ inputs.org-read-token }}
+        result-encoding: string
+        script: |
+          const fn = require('${{ inputs.scripts-dir }}/auth-utils.js')
+          return await fn({ github, core })
+
+    - name: Reject — remove label, post comment, hard fail
+      if: steps.check.outputs.result != 'true'
+      uses: actions/github-script@v7
+      env:
+        ACTION:        reject
+        ORG:           ${{ inputs.org }}
+        REPO_OWNER:    ${{ inputs.repo-owner }}
+        REPO_NAME:     ${{ inputs.repo-name }}
+        ISSUE_NUMBER:  ${{ inputs.issue-number }}
+        TRIGGER_EVENT: ${{ inputs.trigger-event }}
+        LABEL_NAME:    ${{ inputs.label-name }}
+        USERNAME:      ${{ inputs.username }}
+        AGENT_NAME:    ${{ inputs.agent-name }}
+      with:
+        github-token: ${{ inputs.app-token }}
+        script: |
+          const fn = require('${{ inputs.scripts-dir }}/auth-utils.js')
+          await fn({ github, core })

@@ -1,0 +1,77 @@
+name: Update Status Card
+description: >
+  Creates or updates the Hall status card comment on the triggering issue or PR.
+  The card is identified by the <!-- hall-status --> HTML marker. If no card exists,
+  one is created. If one exists, it is edited in-place. Never posts a new comment
+  when a card already exists.
+
+inputs:
+  app-token:
+    description: GitHub App installation token
+    required: true
+  repo-owner:
+    description: Owner of the repository where the comment lives
+    required: true
+  repo-name:
+    description: Repository name
+    required: true
+  issue-number:
+    description: Issue or PR number to post/update the card on
+    required: true
+  agent:
+    description: Agent name (e.g. hamlet)
+    required: true
+  stage:
+    description: >
+      Current lifecycle stage. One of:
+      dispatching | analyzing | awaiting-input | working | pr-opened | ci-fix | escalated | failed | queued | done
+      done is the terminal state for both code tasks (PR merged) and non-code tasks (advising/researching response posted).
+    required: true
+  dispatched-at:
+    description: ISO timestamp of the initial dispatch (used only on card creation)
+    required: false
+    default: ""
+  branch:
+    description: Working branch name (e.g. hall/hamlet/issue-42), or empty
+    required: false
+    default: ""
+  pr-number:
+    description: PR number if one has been opened, or empty
+    required: false
+    default: ""
+  extra:
+    description: Optional extra line appended to the stage value (e.g. retry count)
+    required: false
+    default: ""
+  scripts-dir:
+    description: Path to the scripts/ directory (default assumes Hall repo checked out at .hall/)
+    required: false
+    default: ".hall/scripts"
+
+outputs:
+  comment-id:
+    description: ID of the created or updated comment
+    value: ${{ steps.upsert.outputs.comment-id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Create or update status card
+      id: upsert
+      uses: actions/github-script@v7
+      env:
+        REPO_OWNER:    ${{ inputs.repo-owner }}
+        REPO_NAME:     ${{ inputs.repo-name }}
+        ISSUE_NUMBER:  ${{ inputs.issue-number }}
+        AGENT:         ${{ inputs.agent }}
+        STAGE:         ${{ inputs.stage }}
+        BRANCH:        ${{ inputs.branch }}
+        PR_NUMBER:     ${{ inputs.pr-number }}
+        EXTRA:         ${{ inputs.extra }}
+        DISPATCHED_AT: ${{ inputs.dispatched-at }}
+        AGENTS_JSON:   ${{ inputs.scripts-dir }}/../agents.json
+      with:
+        github-token: ${{ inputs.app-token }}
+        script: |
+          const fn = require('${{ inputs.scripts-dir }}/update-status-card.js')
+          await fn({ github, context, core })

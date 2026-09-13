@@ -1,0 +1,73 @@
+name: Task Cleanup
+description: >
+  Triggered on PR close (merged or not) for a hall-labeled PR.
+  Deletes the task memory cache, removes the hall:{agent} label from the PR,
+  and posts an optional summary comment on the linked issue.
+  The issue/PR thread is never modified beyond the summary — it remains as
+  permanent history.
+
+inputs:
+  app-token:
+    description: GitHub App installation token
+    required: true
+  agent:
+    description: Agent identifier (e.g. hamlet) — used to find the label hall:{agent}
+    required: true
+  repo-owner:
+    description: Repository owner
+    required: true
+  repo-name:
+    description: Repository name
+    required: true
+  pr-number:
+    description: PR number being closed
+    required: true
+  issue-number:
+    description: Linked issue number (empty if no linked issue)
+    required: false
+    default: ""
+  merged:
+    description: "true if the PR was merged, false if just closed"
+    required: false
+    default: "false"
+  scripts-dir:
+    description: Path to the scripts/ directory (default assumes Hall repo checked out at .hall/)
+    required: false
+    default: ".hall/scripts"
+
+runs:
+  using: composite
+  steps:
+    - name: Compute memory cache key
+      id: key
+      shell: bash
+      run: |
+        SAFE_REPO=$(echo "${{ inputs.repo-owner }}/${{ inputs.repo-name }}" | tr '/' '-')
+        echo "cache-key=hall-task-${SAFE_REPO}-${{ inputs.pr-number }}" >> "$GITHUB_OUTPUT"
+
+    - name: Delete task memory cache
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.app-token }}
+      run: |
+        gh api \
+          --method DELETE \
+          -H "Accept: application/vnd.github+json" \
+          "/repos/${{ inputs.repo-owner }}/${{ inputs.repo-name }}/actions/caches?key=${{ steps.key.outputs.cache-key }}" \
+          || true
+
+    - name: Cleanup PR labels and post summary
+      uses: actions/github-script@v7
+      env:
+        ACTION:       cleanup
+        REPO_OWNER:   ${{ inputs.repo-owner }}
+        REPO_NAME:    ${{ inputs.repo-name }}
+        PR_NUMBER:    ${{ inputs.pr-number }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+        AGENT:        ${{ inputs.agent }}
+        MERGED:       ${{ inputs.merged }}
+      with:
+        github-token: ${{ inputs.app-token }}
+        script: |
+          const fn = require('${{ inputs.scripts-dir }}/pr-utils.js')
+          await fn({ github, core })

@@ -1,0 +1,7 @@
+routing:
+  # Per-invoker caps are stored as HALL_WEEKLY_CAP in each invoker/<handle> environment.
+  # This file no longer holds cap values — environment variables are the source of truth.
+  reset_day: monday       # Day HALL_USAGE_COUNT is zeroed by the weekly-reset workflow
+
+  fallback: queue         # behaviour when cap is exceeded: queue the request
+  strategy: least_used    # how to pick an alternate when the requested agent is capped (C-4)

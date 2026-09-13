@@ -1,0 +1,117 @@
+name: Post-Dispatch
+description: >
+  Runs after a successful agent dispatch. Increments the weekly counter,
+  uploads an invocation audit log as an Actions Artifact, applies the
+  hall:{agent} label to any PR the agent opened, and updates the status card.
+
+inputs:
+  app-token:
+    description: GitHub App installation token
+    required: true
+  agent:
+    description: Agent identifier (e.g. hamlet)
+    required: true
+  agent-dispatched:
+    description: Agent that was actually dispatched (may differ from requested if rerouted)
+    required: true
+  rerouted:
+    description: "true | false — whether the request was rerouted to a different agent"
+    required: false
+    default: "false"
+  repo-owner:
+    description: Target repository owner
+    required: true
+  repo-name:
+    description: Target repository name
+    required: true
+  issue-number:
+    description: Originating issue or PR number
+    required: true
+  pr-number:
+    description: PR opened by the agent (empty if none)
+    required: false
+    default: ""
+  invoker:
+    description: GitHub login of the invoker
+    required: true
+  team-validated:
+    description: Team slug that validated the invoker
+    required: true
+  token-input:
+    description: Total input tokens consumed by this dispatch
+    required: false
+    default: "0"
+  token-output:
+    description: Total output tokens consumed by this dispatch
+    required: false
+    default: "0"
+  retry-count:
+    description: Retry attempt number (0 for initial dispatch)
+    required: false
+    default: "0"
+  outcome:
+    description: "pr_created | comment_posted | awaiting_input | failed"
+    required: true
+  weekly-count-after:
+    description: Weekly invocation count after this dispatch
+    required: false
+    default: "0"
+  model:
+    description: Model ID used for this dispatch (e.g. claude-sonnet-4-6)
+    required: false
+    default: ""
+  mcp-servers:
+    description: Comma-separated list of MCP server names provisioned for this dispatch
+    required: false
+    default: ""
+  scripts-dir:
+    description: Path to the scripts/ directory (default assumes Hall repo checked out at .hall/)
+    required: false
+    default: ".hall/scripts"
+
+runs:
+  using: composite
+  steps:
+    - name: Apply hall label to PR
+      if: inputs.pr-number != ''
+      uses: actions/github-script@v7
+      env:
+        ACTION:     apply-agent
+        REPO_OWNER: ${{ inputs.repo-owner }}
+        REPO_NAME:  ${{ inputs.repo-name }}
+        PR_NUMBER:  ${{ inputs.pr-number }}
+        AGENT:      ${{ inputs.agent-dispatched }}
+      with:
+        github-token: ${{ inputs.app-token }}
+        script: |
+          const fn = require('${{ inputs.scripts-dir }}/label-utils.js')
+          await fn({ github, core })
+
+    - name: Write invocation audit log
+      shell: bash
+      env:
+        AGENT:               ${{ inputs.agent }}
+        AGENT_DISPATCHED:    ${{ inputs.agent-dispatched }}
+        REROUTED:            ${{ inputs.rerouted }}
+        REPO_OWNER:          ${{ inputs.repo-owner }}
+        REPO_NAME:           ${{ inputs.repo-name }}
+        ISSUE_NUMBER:        ${{ inputs.issue-number }}
+        PR_NUMBER:           ${{ inputs.pr-number }}
+        INVOKER:             ${{ inputs.invoker }}
+        TEAM_VALIDATED:      ${{ inputs.team-validated }}
+        TIMESTAMP_START:     ${{ github.event.created_at }}
+        TOKEN_INPUT:         ${{ inputs.token-input }}
+        TOKEN_OUTPUT:        ${{ inputs.token-output }}
+        RETRY_COUNT:         ${{ inputs.retry-count }}
+        OUTCOME:             ${{ inputs.outcome }}
+        WEEKLY_COUNT_AFTER:  ${{ inputs.weekly-count-after }}
+        MODEL:               ${{ inputs.model }}
+        MCP_SERVERS:         ${{ inputs.mcp-servers }}
+      run: bash "${{ inputs.scripts-dir }}/write-audit-log.sh"
+
+    - name: Upload audit log artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: hall-log-${{ inputs.agent-dispatched }}-${{ inputs.issue-number }}-${{ github.run_id }}
+        path: hall-invocation-log.json
+        retention-days: 90
