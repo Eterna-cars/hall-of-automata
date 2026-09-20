@@ -565,6 +565,65 @@
         ],
         "scope_summary": "Elixir/Phoenix/Ecto/LiveView implementation specialist — builds domain schemas, migrations, OTP processes, and LiveViews in Mix-managed codebases, using TDD as the verification gate."
       }
+    },
+    "nomad": {
+      "display_name": "Nomad 📱",
+      "author": "hall-of-automata[bot]",
+      "teams": [
+        "automata-invokers"
+      ],
+      "model": "claude-sonnet-4-6",
+      "max_retries": 2,
+      "mcp": {
+        "servers": {
+          "fetch": {
+            "runtime": "npx",
+            "package": "@modelcontextprotocol/server-fetch"
+          },
+          "lsp": {
+            "runtime": "go-install",
+            "package": "github.com/isaacphi/mcp-language-server",
+            "lsp_server": "typescript-language-server",
+            "lsp_args": [
+              "--stdio"
+            ],
+            "setup": "scripts/setup-lsp-typescript.sh"
+          },
+          "github": {
+            "runtime": "npx",
+            "package": "@github/github-mcp-server",
+            "env": {
+              "GITHUB_PERSONAL_ACCESS_TOKEN": "{{env.GITHUB_TOKEN}}",
+              "GITHUB_TOOLSETS": "issues,repos,contents,pull_requests"
+            }
+          }
+        },
+        "allowed_tools": [
+          "mcp__fetch__fetch",
+          "mcp__lsp__textDocument_definition",
+          "mcp__lsp__textDocument_references",
+          "mcp__lsp__textDocument_diagnostic",
+          "mcp__lsp__textDocument_hover",
+          "mcp__github__get_file_contents",
+          "mcp__github__get_issue",
+          "mcp__github__push_files",
+          "mcp__github__create_pull_request",
+          "mcp__github__create_branch"
+        ]
+      },
+      "catalog": {
+        "roles": [
+          "implement",
+          "debug"
+        ],
+        "domains": [
+          "react-native",
+          "expo",
+          "mobile-architecture",
+          "mobile-debugging"
+        ],
+        "scope_summary": "React Native / Expo mobile implementation specialist for eterna's mobile/ app — verifies through tsc, lint, and jest only; cannot run a device or emulator."
+      }
     }
   }
 }
